@@ -1,0 +1,14 @@
+[Unit]
+Description=looping script to import medusa site data
+After=medusa-config.service
+Requires=medusa-config.service
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/medusa-data-importer
+Environment="PATH=/var/www/medusa-data-importer/env/bin" "MEDUSA_CONFIG=/var/lib/medusa/medusa-production.ini"
+ExecStart=/var/www/medusa-data-importer/env/bin/python3 /var/www/medusa-data-importer/import.py
+
+[Install]
+WantedBy=multi-user.target
