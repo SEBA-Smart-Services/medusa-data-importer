@@ -4,10 +4,11 @@ import ast
 import boto3
 import csv
 import time
+import logging
 from sqlalchemy import create_engine
 from sqlalchemy.schema import MetaData, Table
 
-# choose which part of the config file to load
+# choose which config file to load
 config_file = os.getenv('MEDUSA_CONFIG', '/var/lib/medusa/medusa-development.ini')
 
 # configparser handles everything as strings so some additional conversion work is needed
@@ -29,6 +30,10 @@ for key in config['flask']:
 for key in config['data-importer']:
     config_dict[key] = ast.literal_eval(config['data-importer'][key])
 
+# configure log file
+logging.basicConfig(filename=config_dict['logfile'], level=logging.INFO, format='%(asctime)s %(message)s')
+logging.info("Medusa data importer initialised")
+
 # connect using sqlalchemy
 engine = create_engine(config_dict['SQLALCHEMY_DATABASE_URI'])
 conn = engine.connect()
@@ -43,45 +48,52 @@ while True:
     filenames = [file['Key'] for file in files['Contents']]
 
     for filename in filenames:
-        is_csv = filename.split('.')[-1] == 'csv'
-        has_site_id = filename.split('_')[0].isdigit()
+        try:
+            # check if the file is valid
+            is_csv = filename.split('.')[-1] == 'csv'
+            has_site_id = filename.split('_')[0].isdigit()
 
-        if is_csv and has_site_id:
-            # remove the folder path from filename
-            filename_local = filename.split('/')[-1]
+            if is_csv and has_site_id:
+                logging.info("Importing file {}".format(filename))
 
-            # download csv from S3 and open with a csv dict reader
-            s3.meta.client.download_file(config_dict['s3_bucket'], filename, filename_local)
-            csvfile = open(filename_local)
-            reader = csv.DictReader(csvfile)
+                # remove the folder path from filename
+                filename_local = filename.split('/')[-1]
 
-            # get site id from folder name prefix
-            site_id = int(filename.split('_')[0])
+                # download csv from S3 and open with a csv dict reader
+                s3.meta.client.download_file(config_dict['s3_bucket'], filename, filename_local)
+                csvfile = open(filename_local)
+                reader = csv.DictReader(csvfile)
 
-            # load ids of existing entries in db. select all rows from table, filter by site id, then select only SeqNos
-            from sqlalchemy.sql import select
-            s = select([alarms_table.c.SeqNo]).where(alarms_table.c.site_id == site_id)
-            result = conn.execute(s)
-            rows = result.fetchall()
-            # put into a set for more efficient lookups
-            seqnos = set([row[0] for row in rows])
+                # get site id from folder name prefix
+                site_id = int(filename.split('_')[0])
 
-            # build list of rows to add. only include a row if it doesn't already exist in db
-            to_add = []
-            for row in reader:
-                if not int(row['SeqNo']) in seqnos:
-                    row['site_id'] = site_id
-                    to_add.append(row)
+                # load ids of existing entries in db. select all rows from table, filter by site id, then select only SeqNos
+                from sqlalchemy.sql import select
+                s = select([alarms_table.c.SeqNo]).where(alarms_table.c.site_id == site_id)
+                result = conn.execute(s)
+                rows = result.fetchall()
+                # put into a set for more efficient lookups
+                seqnos = set([row[0] for row in rows])
 
-            # insert to db
-            if len(to_add) > 0:
-                conn.execute(alarms_table.insert(), to_add)
+                # build list of rows to add. only include a row if it doesn't already exist in db
+                to_add = []
+                for row in reader:
+                    if not int(row['SeqNo']) in seqnos:
+                        row['site_id'] = site_id
+                        to_add.append(row)
 
-            # delete file locally
-            os.remove(filename_local)
+                # insert to db
+                if len(to_add) > 0:
+                    conn.execute(alarms_table.insert(), to_add)
 
-            # delete file on s3 bucket
-            s3.meta.client.delete_object(Bucket=config_dict['s3_bucket'], Key=filename)
+                # delete file locally
+                os.remove(filename_local)
+
+                # delete file on s3 bucket
+                s3.meta.client.delete_object(Bucket=config_dict['s3_bucket'], Key=filename)
+
+        except Exception as e:
+            logging.error("Exception {} when trying to import {}".format(e, filename))
 
     # sleep
     time.sleep(config_dict['loop_seconds'])
