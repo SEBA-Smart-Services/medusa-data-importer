@@ -5,7 +5,7 @@ import boto3
 import csv
 import time
 import logging
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.schema import MetaData, Table
 
 # choose which config file to load
@@ -38,12 +38,16 @@ logging.info("Medusa data importer initialised")
 engine = create_engine(config_dict['SQLALCHEMY_DATABASE_URI'])
 conn = engine.connect()
 meta = MetaData(bind=engine)
-alarms_table = Table('alarm', meta, autoload=True)
+logged_entity_table = Table('logged_entity', meta, autoload=True)
+log_time_value_table = Table('log_time_value', meta, autoload=True)
+alarm_table = Table('alarm', meta, autoload=True)
+
+# configure s3 connection
+s3 = boto3.resource('s3')
 
 # main loop
 while True:
     # iterate through files in bucket
-    s3 = boto3.resource('s3')
     files = s3.meta.client.list_objects_v2(Bucket=config_dict['s3_bucket'])
     # if there are no files, then contents key will not exist
     if 'Contents' in files:
@@ -56,43 +60,70 @@ while True:
                 has_site_id = filename.split('_')[0].isdigit()
 
                 if is_csv and has_site_id:
-                    logging.info("Importing file {}".format(filename))
-
                     # remove the folder path from filename
                     filename_local = filename.split('/')[-1]
 
-                    # download csv from S3 and open with a csv dict reader
-                    s3.meta.client.download_file(config_dict['s3_bucket'], filename, filename_local)
-                    csvfile = open(filename_local)
-                    reader = csv.DictReader(csvfile)
+                    # find which table it should be inserted into
+                    filename_local_parts = filename_local.split('_')
+                    if filename_local_parts[1] == 'tbLoggedEntities':
+                        table = logged_entity_table
+                        pk_col1 = logged_entity_table.c.ID
+                        pk_col2 = None
+                        table_valid = True
+                    elif filename_local_parts[1] == 'tbLogTimeValues':
+                        table = log_time_value_table
+                        pk_col1 = log_time_value_table.c.SeqNo
+                        pk_col2 = log_time_value_table.c.ParentID
+                        table_valid = True
+                    elif filename_local_parts[1] == 'tbAlarmsEvents':
+                        table = alarm_table
+                        pk_col1 = alarm_table.c.SeqNo
+                        pk_col2 = None
+                        table_valid = True
+                    else:
+                        table_valid = False
 
-                    # get site id from folder name prefix
-                    site_id = int(filename.split('_')[0])
+                    if table_valid:
+                        logging.info("Importing file {}".format(filename))
 
-                    # load ids of existing entries in db. select all rows from table, filter by site id, then select only SeqNos
-                    from sqlalchemy.sql import select
-                    s = select([alarms_table.c.SeqNo]).where(alarms_table.c.site_id == site_id)
-                    result = conn.execute(s)
-                    rows = result.fetchall()
-                    # put into a set for more efficient lookups
-                    seqnos = set([row[0] for row in rows])
+                        # download csv from S3 and open with a csv dict reader
+                        s3.meta.client.download_file(config_dict['s3_bucket'], filename, filename_local)
+                        csvfile = open(filename_local)
+                        reader = csv.DictReader(csvfile)
 
-                    # build list of rows to add. only include a row if it doesn't already exist in db
-                    to_add = []
-                    for row in reader:
-                        if not int(row['SeqNo']) in seqnos:
-                            row['site_id'] = site_id
-                            to_add.append(row)
+                        # get site id from folder name prefix
+                        site_id = int(filename.split('_')[0])
 
-                    # insert to db
-                    if len(to_add) > 0:
-                        conn.execute(alarms_table.insert(), to_add)
+                        # load ids of existing entries in db. select all rows from table, filter by site id, then select only primary keys (as a tuple)
+                        s = select([pk_col1, pk_col2]).where(table.c.site_id == site_id)
+                        result = conn.execute(s)
+                        rows = result.fetchall()
+                        # put into a set for more efficient lookups
+                        primary_keys = set([row[:] for row in rows])
 
-                    # delete file locally
-                    os.remove(filename_local)
+                        # build list of rows to add. only include a row if it doesn't already exist in db
+                        to_add = []
+                        for row in reader:
+                            # assemble the tuple of primary keys to search for
+                            pk1 = int(row[pk_col1.name])
+                            if pk_col2 is None:
+                                pk2 = None
+                            else:
+                                pk2 = int(row[pk_col2.name])
 
-                    # delete file on s3 bucket
-                    s3.meta.client.delete_object(Bucket=config_dict['s3_bucket'], Key=filename)
+                            if not (pk1, pk2) in primary_keys:
+                                row['site_id'] = site_id
+                                to_add.append(row)
+
+                        # insert to db
+                        if len(to_add) > 0:
+                            conn.execute(table.insert(), to_add)
+
+                        # delete file locally
+                        os.remove(filename_local)
+
+                        # delete file on s3 bucket
+                        s3.meta.client.delete_object(Bucket=config_dict['s3_bucket'], Key=filename)
 
             except Exception as e:
                 logging.error("Exception {} when trying to import {}".format(e, filename))
